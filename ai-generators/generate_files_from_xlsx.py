@@ -1,25 +1,12 @@
 import os
+import shutil
 import pandas as pd
 import json
 import re
 import sys
 
 # ============================================================
-# Patched generator (no re-run duplicates)
-#
-# Problem you hit:
-#   The previous version used ensure_unique_path() which *avoids overwriting*
-#   existing files by appending "-1", "-2", etc. That is great for manual runs,
-#   but it causes duplicate schema files when the workflow re-runs — and then
-#   build_public_pages.py renders duplicates (e.g., map/address repeated).
-#
-# Fix (Option A):
-#   1) For each processed sheet, CLEAN the target output folder first.
-#      (Only removes files we generate: .json, .md)
-#   2) Use deterministic filenames (slug.json / slug.md) and OVERWRITE.
-#   3) Still prevent collisions *within the same run* by de-duping slugs in-memory
-#      (adds "-2", "-3" only if the workbook itself repeats a slug/title).
-#
+# Drop-in patched generator
 # Supports BOTH:
 #  - legacy workbook sheets: entity_info, Services, Team, Press/News Mentions, Awards & Certifications, etc.
 #  - newer/legal workbook sheets: Business Info, Practice Areas, Lawyers, Media Mentions, Awards, Certifications,
@@ -30,9 +17,6 @@ import sys
 #  - Reviews: review -> review_body (and quote fallback)
 #  - Locations: address_postal -> address_postal_code ; open_hours -> hours
 # ============================================================
-
-CLEAN_OUTPUT_DIRS = True  # Option A: eliminate duplicates by clearing generated folders before writing
-
 
 def slugify(text: str) -> str:
     """Generate clean, URL-friendly slug from text"""
@@ -72,41 +56,11 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def clean_output_dir(output_dir: str, exts=(".json", ".md")):
-    """Remove previously generated files so reruns don't accumulate duplicates."""
-    if not os.path.isdir(output_dir):
-        return
-    removed = 0
-    for fn in os.listdir(output_dir):
-        if fn.lower().endswith(exts):
-            try:
-                os.remove(os.path.join(output_dir, fn))
-                removed += 1
-            except Exception:
-                pass
-    if removed:
-        print(f"🧽 Cleaned {removed} file(s) from {output_dir}")
-
-
-def deterministic_path(output_dir: str, base_slug: str, ext: str, seen_slugs: dict) -> tuple[str, str]:
-    """
-    Deterministic write path: <output_dir>/<slug><ext>, overwriting if present.
-
-    If the workbook repeats a slug/title within the same run, append -2, -3, ...
-    (This is NOT based on filesystem existence, so reruns remain stable.)
-    """
-    base = slugify(base_slug)
-    if not base:
-        base = "untitled"
-
-    n = seen_slugs.get(base, 0) + 1
-    seen_slugs[base] = n
-
-    slug_final = base if n == 1 else f"{base}-{n}"
-    filename = f"{slug_final}{ext}"
-    filepath = os.path.join(output_dir, filename)
-    return filepath, slug_final
-
+def ensure_stable_path(output_dir: str, base_slug: str, ext: str) -> str:
+    """Return a deterministic path (no -1 / -2 suffixes). Existing files will be overwritten."""
+    base_slug = slugify(base_slug)
+    filename = f"{base_slug}{ext}"
+    return os.path.join(output_dir, filename)
 
 def write_json(path: str, data: dict):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -114,7 +68,7 @@ def write_json(path: str, data: dict):
         json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 
 
-def write_md(path: str, title: str, slug: str, body: str, extra_frontmatter=None):
+def write_md(path: str, title: str, slug: str, body: str, extra_frontmatter: dict | None = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     extra_frontmatter = extra_frontmatter or {}
     with open(path, "w", encoding="utf-8") as f:
@@ -130,7 +84,7 @@ def write_md(path: str, title: str, slug: str, body: str, extra_frontmatter=None
         f.write(body or "")
 
 
-def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
+def main(input_file="templates/AI-Visibility-Master-Template.xlsx", clean=False):
     print(f"📂 Opening Excel file: {input_file}")
 
     if not os.path.exists(input_file):
@@ -160,6 +114,18 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
         "press": "schemas/press",
         "case_studies": "schemas/case-studies",
     }
+
+
+    # Optional: clean generated schema folders to remove old -1 duplicates
+    if clean:
+        print("🧽 CLEAN MODE: removing previously generated schema folders (to eliminate old *-1.json duplicates)")
+        for _dir in sorted(set(canonical_output.values())):
+            if os.path.isdir(_dir):
+                shutil.rmtree(_dir)
+                print(f"🗑️ Removed: {_dir}")
+            os.makedirs(_dir, exist_ok=True)
+        print("✅ Clean complete. Regenerating fresh files...")
+
 
     # Sheet aliases (supports both old and new/legal names)
     SHEET_ALIASES = {
@@ -239,7 +205,7 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
             alias_lookup[norm_sheet(a)] = canon
 
     processed_any = False
-    cleaned_dirs = set()
+    generated_paths = set()  # prevent duplicates within a single run
 
     for actual_sheet in xlsx.sheet_names:
         canon = alias_lookup.get(norm_sheet(actual_sheet))
@@ -249,11 +215,6 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
         output_dir = canonical_output[canon]
         os.makedirs(output_dir, exist_ok=True)
-
-        # Option A: clean each output dir only once per run
-        if CLEAN_OUTPUT_DIRS and output_dir not in cleaned_dirs:
-            clean_output_dir(output_dir, exts=(".json", ".md"))
-            cleaned_dirs.add(output_dir)
 
         print(f"\n📄 Processing sheet: {actual_sheet}  →  {canon}  →  {output_dir}")
 
@@ -267,7 +228,6 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
         print(f"🧹 Cleaned column names: {list(df.columns)}")
 
         processed_count = 0
-        seen_slugs = {}
 
         # ----------------------------
         # ORGANIZATION (usually 1 row)
@@ -331,7 +291,7 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
                 path = os.path.join(output_dir, "organization.json")
                 try:
-                    write_json(path, org)  # overwrite
+                    write_json(path, org)
                     print(f"✅ Generated: {path}")
                     processed_count += 1
                     processed_any = True
@@ -350,17 +310,24 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                     continue
 
                 title = _as_str(get_first(row, ["title", "article_title", "name", "headline"]))
-                slug_in = _as_str(get_first(row, ["slug", "article_slug"]))
+                slug = _as_str(get_first(row, ["slug", "article_slug"]))
                 content = _as_str(get_first(row, ["article_content", "article", "content", "body", "markdown"]))
 
-                base_slug = slug_in or (slugify(title) if title else f"article-{idx+1}")
-                path, slug_final = deterministic_path(output_dir, base_slug, ".md", seen_slugs)
+                if not slug:
+                    slug = slugify(title) if title else f"article-{idx+1}"
+
+                path = ensure_stable_path(output_dir, slug, ".md")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
 
                 try:
                     write_md(
                         path=path,
                         title=title,
-                        slug=slug_final,
+                        slug=slug,
                         body=content,
                         extra_frontmatter={
                             "date": _as_str(get_first(row, ["date", "published_date", "publish_date"]))
@@ -385,13 +352,19 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
                 question = _as_str(get_first(row, ["question", "q", "faq_question", "title"]))
                 answer = _as_str(get_first(row, ["answer", "a", "faq_answer", "response", "content"]))
-                slug_in = _as_str(get_first(row, ["slug", "faq_id", "id"]))
+                slug = _as_str(get_first(row, ["slug", "faq_id", "id"]))
 
                 if not question:
                     question = f"Untitled FAQ {idx+1}"
-                base_slug = slug_in or slugify(question)
+                if not slug:
+                    slug = slugify(question)
 
-                path, slug_final = deterministic_path(output_dir, base_slug, ".json", seen_slugs)
+                path = ensure_stable_path(output_dir, slug, ".json")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
                 data = {"question": question, "answer": answer}
 
                 try:
@@ -414,7 +387,7 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                     continue
 
                 service_name = _as_str(get_first(row, ["service_name", "practice_area", "practice_area_name", "name", "title"]))
-                slug_in = _as_str(get_first(row, ["slug", "service_id", "id"]))
+                slug = _as_str(get_first(row, ["slug", "service_id", "id"]))
                 description = _as_str(get_first(row, ["description", "service_description", "summary"]))
                 price_range = _as_str(get_first(row, ["price_range", "priceRange"]))
                 license_number = _as_str(get_first(row, ["license_number", "license"]))
@@ -424,14 +397,19 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
                 if not service_name:
                     service_name = f"Service {idx+1}"
-                base_slug = slug_in or slugify(service_name)
+                if not slug:
+                    slug = slugify(service_name)
 
-                path, slug_final = deterministic_path(output_dir, base_slug, ".json", seen_slugs)
+                path = ensure_stable_path(output_dir, slug, ".json")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
 
                 data = {
                     "name": service_name,
                     "description": description,
-                    "slug": slug_final,
                 }
                 if price_range:
                     data["priceRange"] = price_range
@@ -479,7 +457,7 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                     ln = _as_str(get_first(row, ["last_name", "lastname"]))
                     member_name = " ".join([p for p in [fn, ln] if p]).strip()
 
-                slug_in = _as_str(get_first(row, ["slug", "member_id", "lawyer_id", "id"]))
+                slug = _as_str(get_first(row, ["slug", "member_id", "lawyer_id", "id"]))
                 role = _as_str(get_first(row, ["role", "title", "position"]))
                 bio = _as_str(get_first(row, ["bio", "description", "about", "summary"]))
                 license_number = _as_str(get_first(row, ["license_number", "license"]))
@@ -488,16 +466,21 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
                 if not member_name:
                     member_name = f"Member {idx+1}"
-                base_slug = slug_in or slugify(member_name)
+                if not slug:
+                    slug = slugify(member_name)
 
-                path, slug_final = deterministic_path(output_dir, base_slug, ".json", seen_slugs)
+                path = ensure_stable_path(output_dir, slug, ".json")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
 
                 data = {
-                    "name": member_name,
-                    "role": role,
-                    "description": bio,
-                    "slug": slug_final,
-                }
+    "name": member_name,
+    "role": role,
+    "description": bio,
+}
 
                 if license_number:
                     data["license"] = license_number
@@ -537,12 +520,19 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
 
                 title = _as_str(get_first(row, ["review_title", "title", "headline"]))
                 body = _as_str(get_first(row, ["review_body", "review", "quote", "testimonial", "content"]))
-                slug_in = _as_str(get_first(row, ["slug", "review_id", "id"]))
+                slug = _as_str(get_first(row, ["slug", "review_id", "id"]))
                 rating = get_first(row, ["rating", "stars"])
                 date = _as_str(get_first(row, ["date", "review_date"]))
 
-                base_slug = slug_in or (slugify(title) if title else f"review-{idx+1}")
-                path, slug_final = deterministic_path(output_dir, base_slug, ".json", seen_slugs)
+                if not slug:
+                    slug = slugify(title) if title else f"review-{idx+1}"
+
+                path = ensure_stable_path(output_dir, slug, ".json")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
 
                 data = {}
                 for col in df.columns:
@@ -564,8 +554,6 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                 if date:
                     data["date"] = date
 
-                data["slug"] = slug_final
-
                 try:
                     write_json(path, data)
                     print(f"✅ Generated: {path}")
@@ -586,10 +574,16 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                     continue
 
                 name = _as_str(get_first(row, ["location_name", "name", "office_name", "title"]))
-                slug_in = _as_str(get_first(row, ["slug", "location_id", "id"]))
-                base_slug = slug_in or (slugify(name) if name else f"location-{idx+1}")
+                slug = _as_str(get_first(row, ["slug", "location_id", "id"]))
+                if not slug:
+                    slug = slugify(name) if name else f"location-{idx+1}"
 
-                path, slug_final = deterministic_path(output_dir, base_slug, ".json", seen_slugs)
+                path = ensure_stable_path(output_dir, slug, ".json")
+                # Prevent duplicate writes in a single run (same slug repeated in sheet)
+                if path in generated_paths:
+                    print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                    continue
+                generated_paths.add(path)
 
                 data = {}
                 for col in df.columns:
@@ -608,8 +602,6 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                     data["hours"] = open_hours
                 if name and "location_name" not in data:
                     data["location_name"] = name
-
-                data["slug"] = slug_final
 
                 try:
                     write_json(path, data)
@@ -638,7 +630,12 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
             if not id_field:
                 id_field = f"item-{idx+1}"
 
-            path, slug_final = deterministic_path(output_dir, id_field, ".json", seen_slugs)
+            path = ensure_stable_path(output_dir, id_field, ".json")
+            # Prevent duplicate writes in a single run (same slug repeated in sheet)
+            if path in generated_paths:
+                print(f"⚠️ Duplicate slug/path skipped (already generated this run): /mnt/data/generate_files_from_xlsx.py")
+                continue
+            generated_paths.add(path)
 
             data = {}
             for col in df.columns:
@@ -648,8 +645,6 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
                 if hasattr(v, "item"):
                     v = v.item()
                 data[col] = v
-
-            data["slug"] = slug_final
 
             if canon == "press":
                 t = _as_str(get_first(row, ["title", "mention_title", "headline"]))
@@ -671,7 +666,7 @@ def main(input_file="templates/AI-Visibility-Master-Template.xlsx"):
         print("Supported sheet aliases include:", sorted({a for v in SHEET_ALIASES.values() for a in v}))
         sys.exit(2)
 
-    print("\n🎉 All files generated successfully (no re-run duplicates).")
+    print("\n🎉 All files generated successfully.")
 
 
 if __name__ == "__main__":
@@ -679,11 +674,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate schema files from Excel.")
     parser.add_argument("--input", type=str, default="templates/AI-Visibility-Master-Template.xlsx",
                         help="Path to input Excel file")
-    parser.add_argument("--no-clean", action="store_true",
-                        help="Do not clean output dirs before writing (not recommended)")
+    parser.add_argument("--clean", action="store_true", help="Delete generated schemas/* folders before regenerating (removes old *-1 duplicates)")
     args = parser.parse_args()
-
-    if args.no_clean:
-        CLEAN_OUTPUT_DIRS = False
-
-    main(args.input)
+    main(args.input, clean=args.clean)
