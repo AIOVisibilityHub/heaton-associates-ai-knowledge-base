@@ -453,10 +453,12 @@ def generate_contact_page():
             block += f"<h3>{escape_html(name)}</h3><p>"
             if person:
                 block += f"<strong>Contact:</strong> {escape_html(person)}<br>"
-  if addr:
-    block += f"<strong>Address:</strong> {escape_html(addr)}<br>"
-     # Phone/Email shown in Quick Contact card above to avoid duplicates
-# Keep only address/hours/website/map in each location card.
+            if addr:
+                block += f"<strong>Address:</strong> {escape_html(addr)}<br>"
+
+            # Phone/Email shown in Quick Contact card above to avoid duplicates.
+            # Keep only address/hours/website/map in each location card.
+
 
             if hours:
                 block += f"<strong>Hours:</strong> {escape_html(hours)}<br>"
